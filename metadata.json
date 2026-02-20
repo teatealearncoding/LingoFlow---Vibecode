@@ -1,0 +1,7 @@
+{
+  "name": "LingoFlow",
+  "description": "An ultra-minimalist English flashcard app for advanced learners. Process tech articles, extract C1/C2 vocabulary, and study using FSRS logic with Electric Blue accents.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

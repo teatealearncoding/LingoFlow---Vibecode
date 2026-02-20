@@ -49,7 +49,7 @@ export async function processArticle(content: string, url: string = "") {
 export async function getSuggestedMaterial() {
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: "Find 1 recent interesting article from Morning Brew (morningbrew.com) and 1 from VnExpress International (e.vnexpress.net). Return their titles, a short teaser summary for each, and their direct URLs.",
+    contents: "Find 3 recent interesting articles from Morning Brew (morningbrew.com) and 3 from VnExpress International (e.vnexpress.net). Return their titles, a short teaser summary for each, and their direct URLs.",
     config: {
       tools: [{ googleSearch: {} }],
       responseMimeType: "application/json",

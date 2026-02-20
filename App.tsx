@@ -242,6 +242,34 @@ const Home: React.FC<{ user: User }> = ({ user }) => {
     }
   };
 
+  const handleDismiss = async (idx: number) => {
+    // Remove from the full pool
+    const newPool = [...suggestions];
+    newPool.splice(idx, 1);
+    setSuggestions(newPool);
+    
+    // Update cache
+    localStorage.setItem(STORAGE_KEYS.SUGGESTIONS, JSON.stringify(newPool));
+
+    // If pool is getting low, fetch more in the background
+    if (newPool.length < 2) {
+      setIsLoadingSuggestions(true);
+      try {
+        const data = await getSuggestedMaterial();
+        // Filter out any we already have
+        const filtered = data.filter((item: any) => !newPool.find(s => s.url === item.url));
+        const merged = [...newPool, ...filtered];
+        setSuggestions(merged);
+        localStorage.setItem(STORAGE_KEYS.SUGGESTIONS, JSON.stringify(merged));
+        localStorage.setItem(STORAGE_KEYS.SUGGESTIONS_TS, Date.now().toString());
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setIsLoadingSuggestions(false);
+      }
+    }
+  };
+
   return (
     <div className="min-h-screen pt-36 px-6 max-w-3xl mx-auto flex flex-col items-center pb-32">
       {isProcessing && <LoadingOverlay message="Running AI Analysis..." />}
@@ -298,16 +326,24 @@ const Home: React.FC<{ user: User }> = ({ user }) => {
               <div key={i} className="h-48 bg-white/5 border border-white/5 rounded-3xl animate-pulse"></div>
             ))
           ) : (
-            suggestions.map((item, idx) => (
+            suggestions.slice(0, 2).map((item, idx) => (
               <div key={idx} className="bg-[#0a0a0a] border border-white/5 p-8 rounded-3xl hover:border-[#39FF14]/30 transition-all group flex flex-col justify-between shadow-lg">
                 <div>
-                  <p className="text-[9px] font-black text-[#39FF14] uppercase tracking-widest mb-3">{item.source}</p>
-                  <h4 className="text-xl font-bold tracking-tight text-white mb-3 group-hover:text-[#39FF14] transition-colors line-clamp-2">{item.title}</h4>
+                  <div className="flex justify-between items-start mb-3">
+                    <p className="text-[9px] font-black text-[#39FF14] uppercase tracking-widest">{item.source}</p>
+                    <a href={item.url} target="_blank" rel="noopener noreferrer" className="text-white/20 hover:text-[#00F3FF] transition-colors">
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+                    </a>
+                  </div>
+                  <h4 className="text-xl font-bold tracking-tight text-white mb-3 group-hover:text-[#39FF14] transition-colors line-clamp-2">
+                    <a href={item.url} target="_blank" rel="noopener noreferrer">{item.title}</a>
+                  </h4>
                   <p className="text-white/40 text-sm leading-relaxed mb-6 line-clamp-3 font-light">{item.summary}</p>
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => handleProcess(item.url)} className="flex-grow py-4 bg-white/5 hover:bg-[#39FF14] hover:text-black border border-white/10 text-white font-black uppercase tracking-[0.2em] text-[9px] rounded-xl transition-all">Flashcards</button>
                   <button onClick={() => handleSummarize(item.url)} className="flex-grow py-4 bg-black border border-white/10 text-[#39FF14] font-black uppercase tracking-[0.2em] text-[9px] rounded-xl hover:bg-[#39FF14]/10 transition-all">Summarize</button>
+                  <button onClick={() => handleDismiss(idx)} className="px-4 py-4 bg-black border border-white/10 text-red-500/60 hover:text-red-500 font-black uppercase tracking-[0.2em] text-[9px] rounded-xl hover:bg-red-500/10 transition-all">Dismiss</button>
                 </div>
               </div>
             ))

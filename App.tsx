@@ -1,9 +1,27 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { HashRouter as Router, Routes, Route, Link, useNavigate, Navigate } from 'react-router-dom';
+import ReactMarkdown from 'react-markdown';
 import { Flashcard, Difficulty, User } from './types';
 import { processArticle, playPronunciation, summarizeArticle, getSuggestedMaterial } from './services/geminiService';
 import { initializeCard, scheduleReview } from './services/srsService';
+import { auth, db as firestore, isFirebaseConfigured } from './services/firebase';
+import { 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  collection, 
+  query, 
+  where, 
+  getDocs, 
+  setDoc, 
+  doc, 
+  deleteDoc,
+  writeBatch
+} from 'firebase/firestore';
 
 // --- User-Scoped Storage Keys ---
 const STORAGE_KEYS = {
@@ -12,26 +30,6 @@ const STORAGE_KEYS = {
   SUMMARY: (uid: string) => `lingoflow_summary_${uid}`,
   SUGGESTIONS: 'lingoflow_global_suggestions',
   SUGGESTIONS_TS: 'lingoflow_suggestions_ts'
-};
-
-// --- API Helper ---
-const api = {
-  async request(path: string, method = 'GET', body?: any, token?: string) {
-    const headers: any = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    
-    const res = await fetch(path, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined
-    });
-    
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'API Error');
-    }
-    return res.json();
-  }
 };
 
 // --- UI Components ---
@@ -88,12 +86,15 @@ const AuthPage: React.FC<{ onLogin: (user: User) => void }> = ({ onLogin }) => {
     }
 
     try {
-      const path = isLogin ? '/api/auth/login' : '/api/auth/register';
-      const data = await api.request(path, 'POST', { email, password });
-      onLogin({ ...data.user, token: data.token });
+      if (isLogin) {
+        await signInWithEmailAndPassword(auth, email, password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password);
+      }
       navigate('/');
     } catch (err: any) {
-      setError(err.message);
+      console.error(err);
+      setError(err.message || "Authentication failed.");
     }
   };
 
@@ -197,24 +198,28 @@ const Home: React.FC<{ user: User }> = ({ user }) => {
     try {
       const result = await processArticle(targetInput, targetInput.startsWith('http') ? targetInput : 'Pasted Text');
       
-      // Fetch existing cards from API to merge
-      const existing: Flashcard[] = await api.request('/api/cards', 'GET', undefined, user.token);
+      // Fetch existing cards from Firestore
+      const q = query(collection(firestore, "flashcards"), where("userId", "==", user.id));
+      const querySnapshot = await getDocs(q);
+      const existing: Flashcard[] = [];
+      querySnapshot.forEach((doc) => existing.push(doc.data() as Flashcard));
       
       const newCards = result.words.map((w: any) => initializeCard(w, result.title, user.id));
       
-      const merged = [...existing];
-      const added: Flashcard[] = [];
+      const batch = writeBatch(firestore);
+      let addedCount = 0;
+
       newCards.forEach((newCard: Flashcard) => {
-        const exists = merged.find(c => c.word.toLowerCase() === newCard.word.toLowerCase());
+        const exists = existing.find(c => c.word.toLowerCase() === newCard.word.toLowerCase());
         if (!exists) {
-          merged.push(newCard);
-          added.push(newCard);
+          const cardRef = doc(firestore, "flashcards", newCard.id);
+          batch.set(cardRef, newCard);
+          addedCount++;
         }
       });
 
-      // Sync new cards to backend
-      if (added.length > 0) {
-        await api.request('/api/cards/sync', 'POST', { cards: added }, user.token);
+      if (addedCount > 0) {
+        await batch.commit();
       }
 
       setInput('');
@@ -282,7 +287,9 @@ const Home: React.FC<{ user: User }> = ({ user }) => {
             </button>
             <h3 className="text-[#39FF14] text-[10px] font-black uppercase tracking-[0.3em] mb-6">Article Insights</h3>
             <div className="flex-grow overflow-y-auto pr-4 scrollbar-thin scrollbar-thumb-white/10">
-              <div className="text-white/80 space-y-4 text-lg font-light leading-relaxed whitespace-pre-line">{summary}</div>
+              <div className="text-white/80 space-y-4 text-lg font-light leading-relaxed markdown-body">
+                <ReactMarkdown>{summary}</ReactMarkdown>
+              </div>
             </div>
             <div className="flex gap-4 mt-8">
                <button onClick={() => setSummary(null)} className="flex-1 py-4 bg-[#39FF14]/10 border border-[#39FF14]/20 text-[#39FF14] font-black uppercase tracking-[0.2em] text-[10px] rounded-xl hover:bg-[#39FF14]/20 transition-all">Keep Reading</button>
@@ -338,7 +345,9 @@ const Home: React.FC<{ user: User }> = ({ user }) => {
                   <h4 className="text-xl font-bold tracking-tight text-white mb-3 group-hover:text-[#39FF14] transition-colors line-clamp-2">
                     <a href={item.url} target="_blank" rel="noopener noreferrer">{item.title}</a>
                   </h4>
-                  <p className="text-white/40 text-sm leading-relaxed mb-6 line-clamp-3 font-light">{item.summary}</p>
+                  <div className="text-white/40 text-sm leading-relaxed mb-6 line-clamp-3 font-light markdown-body mini">
+                    <ReactMarkdown>{item.summary}</ReactMarkdown>
+                  </div>
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => handleProcess(item.url)} className="flex-grow py-4 bg-white/5 hover:bg-[#39FF14] hover:text-black border border-white/10 text-white font-black uppercase tracking-[0.2em] text-[9px] rounded-xl transition-all">Flashcards</button>
@@ -356,18 +365,22 @@ const Home: React.FC<{ user: User }> = ({ user }) => {
 
 const Bank: React.FC<{ user: User }> = ({ user }) => {
   const [cards, setCards] = useState<Flashcard[]>([]);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchCards = async () => {
       try {
-        const data = await api.request('/api/cards', 'GET', undefined, user.token);
+        const q = query(collection(firestore, "flashcards"), where("userId", "==", user.id));
+        const querySnapshot = await getDocs(q);
+        const data: Flashcard[] = [];
+        querySnapshot.forEach((doc) => data.push(doc.data() as Flashcard));
         setCards(data);
       } catch (err) {
         console.error(err);
       }
     };
     fetchCards();
-  }, [user.id, user.token]);
+  }, [user.id]);
 
   const handleExport = () => {
     const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(cards, null, 2));
@@ -375,6 +388,17 @@ const Bank: React.FC<{ user: User }> = ({ user }) => {
     dlAnchor.setAttribute("href", dataStr);
     dlAnchor.setAttribute("download", `lingoflow_vault_${user.id}.json`);
     dlAnchor.click();
+  };
+
+  const handleDelete = async (cardId: string) => {
+    try {
+      await deleteDoc(doc(firestore, "flashcards", cardId));
+      setCards(prev => prev.filter(c => c.id !== cardId));
+      setConfirmDeleteId(null);
+    } catch (err) {
+      console.error(err);
+      alert("Failed to delete card.");
+    }
   };
 
   return (
@@ -388,7 +412,36 @@ const Bank: React.FC<{ user: User }> = ({ user }) => {
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {cards.map((card) => (
-          <div key={card.id} className="bg-[#0a0a0a] border border-white/5 p-8 rounded-3xl hover:border-[#00F3FF]/30 transition-all duration-500">
+          <div key={card.id} className="bg-[#0a0a0a] border border-white/5 p-8 rounded-3xl hover:border-[#00F3FF]/30 transition-all duration-500 relative group overflow-hidden">
+            {confirmDeleteId === card.id ? (
+              <div className="absolute inset-0 bg-red-600/90 backdrop-blur-sm z-40 flex flex-col items-center justify-center p-6 text-center animate-in fade-in slide-in-from-bottom-4 duration-300">
+                <p className="text-white font-black uppercase tracking-tighter text-xl mb-4">Delete Permanently?</p>
+                <div className="flex gap-3 w-full">
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); handleDelete(card.id); }}
+                    className="flex-1 py-3 bg-white text-red-600 font-black uppercase tracking-widest text-[10px] rounded-xl hover:bg-gray-100 transition-all"
+                  >
+                    Confirm
+                  </button>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); setConfirmDeleteId(null); }}
+                    className="flex-1 py-3 bg-black/20 text-white font-black uppercase tracking-widest text-[10px] rounded-xl hover:bg-black/40 transition-all border border-white/20"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button 
+                onClick={(e) => { e.stopPropagation(); setConfirmDeleteId(card.id); }}
+                className="absolute top-0 left-0 p-8 text-red-500/20 hover:text-red-500 transition-all z-30 group-hover:text-red-500/60"
+                aria-label="Delete card"
+              >
+                <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </button>
+            )}
             <div className="flex justify-between items-start mb-6">
               <div className="space-y-1">
                 <span className="text-[9px] font-black bg-white/10 text-white/60 px-2 py-0.5 rounded tracking-widest uppercase">{card.difficulty}</span>
@@ -412,11 +465,16 @@ const Study: React.FC<{ user: User }> = ({ user }) => {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
   const [isStarted, setIsStarted] = useState(false);
+  const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
 
   useEffect(() => {
     const fetchCards = async () => {
       try {
-        const all = await api.request('/api/cards', 'GET', undefined, user.token);
+        const q = query(collection(firestore, "flashcards"), where("userId", "==", user.id));
+        const querySnapshot = await getDocs(q);
+        const all: Flashcard[] = [];
+        querySnapshot.forEach((doc) => all.push(doc.data() as Flashcard));
+        
         setAllCards(all);
         setDueCards(all.filter((c: Flashcard) => c.due <= Date.now()).sort(() => Math.random() - 0.5));
       } catch (err) {
@@ -424,15 +482,28 @@ const Study: React.FC<{ user: User }> = ({ user }) => {
       }
     };
     fetchCards();
-  }, [user.id, user.token]);
+  }, [user.id]);
+
+  const handleDeleteCard = async (cardId: string) => {
+    try {
+      await deleteDoc(doc(firestore, "flashcards", cardId));
+      setAllCards(prev => prev.filter(c => c.id !== cardId));
+      setDueCards(prev => prev.filter(c => c.id !== cardId));
+      setIsFlipped(false);
+      setIsConfirmingDelete(false);
+    } catch (err) {
+      console.error(err);
+      alert("Failed to delete card.");
+    }
+  };
 
   const handleRate = async (rating: Difficulty) => {
     const card = dueCards[currentIndex];
     const updated = scheduleReview(card, rating);
     
     try {
-      // Sync updated card to backend
-      await api.request('/api/cards/sync', 'POST', { cards: [updated] }, user.token);
+      // Sync updated card to Firestore
+      await setDoc(doc(firestore, "flashcards", updated.id), updated);
       
       // Update local state
       setAllCards(prev => prev.map(c => c.id === card.id ? updated : c));
@@ -508,24 +579,77 @@ const Study: React.FC<{ user: User }> = ({ user }) => {
   const currentCard = dueCards[currentIndex];
 
   return (
-    <div className="min-h-screen pt-32 px-6 max-w-xl mx-auto flex flex-col items-center pb-20">
-      <div className="w-full flex justify-between items-center mb-10 text-[10px] font-black uppercase tracking-[0.2em] text-white/40">
-        <span>Stack: {currentIndex + 1} / {dueCards.length}</span>
+    <div className="min-h-screen pt-32 px-6 max-w-sm mx-auto flex flex-col items-center pb-20 relative">
+      {isConfirmingDelete && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/90 backdrop-blur-md animate-in fade-in duration-300">
+          <div className="bg-[#0a0a0a] border border-red-500/20 p-10 rounded-[2.5rem] max-w-xs w-full text-center shadow-2xl">
+            <div className="w-16 h-16 bg-red-500/10 rounded-full flex items-center justify-center mx-auto mb-6">
+              <svg className="w-8 h-8 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </div>
+            <h3 className="text-2xl font-black uppercase tracking-tighter mb-2">Delete Card?</h3>
+            <p className="text-white/40 text-xs mb-8">This action is permanent and cannot be undone.</p>
+            <div className="space-y-3">
+              <button 
+                onClick={() => handleDeleteCard(currentCard.id)}
+                className="w-full py-4 bg-red-600 text-white font-black uppercase tracking-widest text-[10px] rounded-xl hover:bg-red-700 transition-all"
+              >
+                Confirm Delete
+              </button>
+              <button 
+                onClick={() => setIsConfirmingDelete(false)}
+                className="w-full py-4 bg-white/5 text-white/60 font-black uppercase tracking-widest text-[10px] rounded-xl hover:bg-white/10 transition-all"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="w-full flex justify-between items-center mb-10 text-[10px] font-black uppercase tracking-[0.2em] text-white/40 relative z-30">
+        <div className="flex items-center space-x-4">
+          <button 
+            onClick={(e) => { e.stopPropagation(); setIsConfirmingDelete(true); }}
+            className="p-6 -m-6 text-red-500/40 hover:text-red-500 transition-colors"
+            title="Delete Card"
+          >
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+          </button>
+          <span>Stack: {currentIndex + 1} / {dueCards.length}</span>
+        </div>
         <span className="text-[#00F3FF]">Stage {currentCard.reps}</span>
       </div>
-      <div onClick={() => !isFlipped && setIsFlipped(true)} className={`w-full aspect-[4/5] relative transition-all duration-700 cursor-pointer ${isFlipped ? '[transform:rotateY(180deg)]' : ''}`} style={{ transformStyle: 'preserve-3d' }}>
+      <div onClick={() => setIsFlipped(!isFlipped)} className={`w-full aspect-[4/5] relative transition-all duration-700 cursor-pointer ${isFlipped ? '[transform:rotateY(180deg)]' : ''}`} style={{ transformStyle: 'preserve-3d' }}>
         <div className="absolute inset-0 bg-[#0a0a0a] border-2 border-white/5 rounded-[2.5rem] p-12 flex flex-col items-center justify-center [backface-visibility:hidden] shadow-2xl">
-          <h3 className="text-5xl font-black text-white text-center">{currentCard.word}</h3>
-          <p className="mt-4 text-[#00F3FF] font-mono text-sm tracking-widest">{currentCard.pronunciation}</p>
+          <div className="flex flex-col items-center space-y-4 mb-8">
+            <h3 className="text-5xl font-black text-white text-center">{currentCard.word}</h3>
+            <div className="flex items-center space-x-3">
+              <p className="text-[#00F3FF] font-mono text-sm tracking-widest">{currentCard.pronunciation}</p>
+              <button 
+                onClick={(e) => { e.stopPropagation(); playPronunciation(currentCard.word); }}
+                className="p-2 bg-white/5 rounded-full hover:bg-white/10 transition-colors text-[#00F3FF]"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div className="w-full bg-white/5 p-6 rounded-2xl border border-white/5">
+            <p className="text-white/60 text-center italic font-light leading-relaxed">"{currentCard.context}"</p>
+          </div>
         </div>
         <div className="absolute inset-0 bg-[#00F3FF] text-black rounded-[2.5rem] p-12 flex flex-col items-center justify-center [backface-visibility:hidden] [transform:rotateY(180deg)] shadow-xl">
-          <div className="w-full space-y-10">
-            <h4 className="text-3xl font-black">{currentCard.vietnameseMeaning}</h4>
-            <div className="bg-black/5 p-6 rounded-2xl"><p className="text-lg italic font-medium">"{currentCard.context}"</p></div>
+          <div className="w-full text-center">
+            <h4 className="text-4xl font-black uppercase tracking-tight">{currentCard.vietnameseMeaning}</h4>
           </div>
         </div>
       </div>
-      <div className={`w-full grid grid-cols-4 gap-4 mt-16 transition-all duration-700 ${isFlipped ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-20 pointer-events-none'}`}>
+      <div className="w-full grid grid-cols-4 gap-4 mt-16 transition-all duration-700">
         {[Difficulty.AGAIN, Difficulty.HARD, Difficulty.GOOD, Difficulty.EASY].map((val) => (
           <button key={val} onClick={() => handleRate(val)} className="py-6 border border-white/10 bg-white/5 rounded-2xl text-[10px] font-black uppercase active:scale-95 transition-all hover:bg-white/10">
             {Difficulty[val]}
@@ -539,24 +663,60 @@ const Study: React.FC<{ user: User }> = ({ user }) => {
 // --- App Root ---
 
 const App: React.FC = () => {
-  const [user, setUser] = useState<User | null>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.SESSION);
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        setUser({
+          id: firebaseUser.uid,
+          email: firebaseUser.email || ""
+        });
+      } else {
+        setUser(null);
+      }
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const handleLogout = async () => {
     try {
-      return saved ? JSON.parse(saved) : null;
-    } catch (e) {
-      return null;
+      await signOut(auth);
+    } catch (err) {
+      console.error("Logout failed", err);
     }
-  });
-
-  const handleLogin = (newUser: User) => {
-    setUser(newUser);
-    localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(newUser));
   };
 
-  const handleLogout = () => {
-    setUser(null);
-    localStorage.removeItem(STORAGE_KEYS.SESSION);
-  };
+  if (loading) return <LoadingOverlay message="Authenticating..." />;
+
+  if (!isFirebaseConfigured) {
+    return (
+      <div className="min-h-screen bg-black text-white flex flex-col items-center justify-center p-8 text-center">
+        <div className="max-w-md space-y-8">
+          <h1 className="text-4xl font-black tracking-tighter uppercase text-[#00F3FF]">Firebase Setup Required</h1>
+          <p className="text-white/60 font-light leading-relaxed">
+            To enable persistent storage and secure authentication, please configure your Firebase environment variables in AI Studio.
+          </p>
+          <div className="bg-[#0a0a0a] border border-white/10 p-6 rounded-2xl text-left space-y-4">
+            <p className="text-[10px] font-black uppercase tracking-widest text-[#39FF14]">Required Variables:</p>
+            <ul className="text-[10px] font-mono text-white/40 space-y-2">
+              <li>VITE_FIREBASE_API_KEY</li>
+              <li>VITE_FIREBASE_AUTH_DOMAIN</li>
+              <li>VITE_FIREBASE_PROJECT_ID</li>
+              <li>VITE_FIREBASE_STORAGE_BUCKET</li>
+              <li>VITE_FIREBASE_MESSAGING_SENDER_ID</li>
+              <li>VITE_FIREBASE_APP_ID</li>
+            </ul>
+          </div>
+          <p className="text-[9px] font-black uppercase tracking-[0.2em] text-white/30">
+            After setting these, the app will automatically initialize.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <Router>
@@ -564,7 +724,7 @@ const App: React.FC = () => {
         <Navbar user={user} onLogout={handleLogout} />
         <main>
           <Routes>
-            <Route path="/auth" element={<AuthPage onLogin={handleLogin} />} />
+            <Route path="/auth" element={user ? <Navigate to="/" /> : <AuthPage onLogin={() => {}} />} />
             <Route path="/" element={user ? <Home user={user} /> : <Navigate to="/auth" />} />
             <Route path="/study" element={user ? <Study user={user} /> : <Navigate to="/auth" />} />
             <Route path="/bank" element={user ? <Bank user={user} /> : <Navigate to="/auth" />} />
